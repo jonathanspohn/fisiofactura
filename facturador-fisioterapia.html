@@ -794,13 +794,26 @@
 
   <!-- ══ TAB: HISTORIAL ══ -->
   <div id="tab-historial" class="tab-panel">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; flex-wrap:wrap; gap:12px">
       <h2 style="font-family:'Playfair Display',serif; font-size:1.4rem">Historial de facturas</h2>
-      <div style="display:flex;gap:8px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-secondary btn-sm" onclick="exportCSV()">⬇ Exportar CSV</button>
+        <button class="btn btn-outline-teal btn-sm" id="btn-zip" onclick="downloadSelectedZIP()" style="display:none">📦 Descargar selección en ZIP</button>
       </div>
     </div>
+    <div style="display:grid; grid-template-columns:1fr 160px; gap:12px; margin-bottom:16px">
+      <input type="text" id="hist-search" placeholder="🔍 Buscar por nombre de paciente..." oninput="filterHistory()" style="width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:0.9rem;background:var(--cream);outline:none;color:var(--ink)">
+      <select id="hist-year" onchange="filterHistory()" style="width:100%;padding:10px 14px;border:1.5px solid var(--border);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:0.9rem;background:var(--cream);outline:none;color:var(--ink)">
+        <option value="">Todos los años</option>
+      </select>
+    </div>
+    <div id="hist-select-bar" style="display:none; align-items:center; gap:12px; margin-bottom:12px; padding:10px 16px; background:var(--teal-light); border-radius:10px; border:1px solid rgba(11,86,63,0.2)">
+      <input type="checkbox" id="hist-select-all" onchange="toggleSelectAll(this.checked)" style="width:16px;height:16px;cursor:pointer">
+      <label for="hist-select-all" style="font-size:0.82rem;font-weight:600;color:var(--teal);cursor:pointer">Seleccionar todas</label>
+      <span id="hist-selected-count" style="font-size:0.8rem;color:var(--ink-light);margin-left:4px"></span>
+    </div>
     <div class="history-list" id="history-list"><p style="color:var(--ink-faint); font-size:0.9rem">Aún no hay facturas generadas.</p></div>
+    <p id="hist-no-results" style="display:none;color:var(--ink-faint);font-size:0.9rem;margin-top:12px">No se encontraron facturas con ese criterio.</p>
   </div>
 
   <!-- ══ TAB: CONFIGURACIÓN ══ -->
@@ -1430,20 +1443,73 @@ async function generateAndSave() {
 }
 
 // ── HISTORY ──────────────────────────────────────────
+// ── HISTORY FILTER STATE ────────────────────────────
+let histFilter = { search: '', year: '' };
+let histSelected = new Set();
+
 function renderHistory() {
-  const list = document.getElementById('history-list');
+  // Populate year filter
+  const yearSel = document.getElementById('hist-year');
+  if (yearSel) {
+    const years = [...new Set(state.invoices.map(i => (i.fecha||'').slice(0,4)).filter(Boolean))].sort().reverse();
+    const cur = yearSel.value;
+    yearSel.innerHTML = '<option value="">Todos los años</option>';
+    years.forEach(y => { const o = document.createElement('option'); o.value = y; o.textContent = y; if (y===cur) o.selected=true; yearSel.appendChild(o); });
+  }
+  filterHistory();
+}
+
+function filterHistory() {
+  const search = (document.getElementById('hist-search')?.value || '').toLowerCase().trim();
+  const year   = document.getElementById('hist-year')?.value || '';
+  histFilter = { search, year };
+
+  const list    = document.getElementById('history-list');
+  const noRes   = document.getElementById('hist-no-results');
+  const selBar  = document.getElementById('hist-select-bar');
+  const btnZip  = document.getElementById('btn-zip');
+
   if (!state.invoices.length) {
     list.innerHTML = '<p style="color:var(--ink-faint); font-size:0.9rem">Aún no hay facturas generadas.</p>';
+    if (noRes) noRes.style.display = 'none';
+    if (selBar) selBar.style.display = 'none';
+    if (btnZip) btnZip.style.display = 'none';
     return;
   }
+
+  const filtered = state.invoices.map((inv, idx) => ({ inv, idx })).filter(({ inv }) => {
+    const matchSearch = !search || (inv.paciente.nombre||'').toLowerCase().includes(search);
+    const matchYear   = !year   || (inv.fecha||'').startsWith(year);
+    return matchSearch && matchYear;
+  });
+
   list.innerHTML = '';
-  state.invoices.forEach((inv, idx) => {
+  if (filtered.length === 0) {
+    if (noRes) noRes.style.display = 'block';
+    if (selBar) selBar.style.display = 'none';
+    if (btnZip) btnZip.style.display = 'none';
+    return;
+  }
+  if (noRes) noRes.style.display = 'none';
+  if (selBar) selBar.style.display = 'flex';
+
+  // Clean up selected that are no longer visible
+  const visibleIdx = new Set(filtered.map(f => f.idx));
+  histSelected.forEach(i => { if (!visibleIdx.has(i)) histSelected.delete(i); });
+  updateSelectionUI();
+
+  filtered.forEach(({ inv, idx }) => {
+    const checked = histSelected.has(idx);
     const div = document.createElement('div');
     div.className = 'hist-item';
+    div.style.cssText = checked ? 'border-color:var(--teal);background:var(--teal-light)' : '';
     div.innerHTML = `
-      <div>
-        <div class="num">${inv.num}</div>
-        <div class="meta">${inv.paciente.nombre} · ${inv.fecha}</div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <input type="checkbox" class="hist-check" data-idx="${idx}" ${checked?'checked':''} onchange="toggleSelect(${idx},this.checked)" style="width:16px;height:16px;cursor:pointer;flex-shrink:0">
+        <div>
+          <div class="num">${inv.num}</div>
+          <div class="meta">${inv.paciente.nombre} · ${inv.fecha}</div>
+        </div>
       </div>
       <div style="display:flex;align-items:center;gap:20px">
         <div class="amount">${eur(inv.total)}</div>
@@ -1455,6 +1521,75 @@ function renderHistory() {
     `;
     list.appendChild(div);
   });
+}
+
+function toggleSelect(idx, checked) {
+  if (checked) histSelected.add(idx); else histSelected.delete(idx);
+  updateSelectionUI();
+  filterHistory();
+}
+
+function toggleSelectAll(checked) {
+  const list = document.getElementById('history-list');
+  list.querySelectorAll('.hist-check').forEach(cb => {
+    const idx = parseInt(cb.dataset.idx);
+    if (checked) histSelected.add(idx); else histSelected.delete(idx);
+  });
+  updateSelectionUI();
+  filterHistory();
+}
+
+function updateSelectionUI() {
+  const count  = histSelected.size;
+  const btnZip = document.getElementById('btn-zip');
+  const label  = document.getElementById('hist-selected-count');
+  const selAll = document.getElementById('hist-select-all');
+  if (btnZip) btnZip.style.display = count > 0 ? 'inline-flex' : 'none';
+  if (label)  label.textContent = count > 0 ? `${count} seleccionada${count>1?'s':''}` : '';
+  // Sync select-all checkbox
+  if (selAll) {
+    const total = document.querySelectorAll('.hist-check').length;
+    selAll.checked = total > 0 && count >= total;
+    selAll.indeterminate = count > 0 && count < total;
+  }
+}
+
+async function downloadSelectedZIP() {
+  if (histSelected.size === 0) { showToast('Selecciona al menos una factura'); return; }
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+
+  showToast('⏳ Generando ZIP...');
+  const zip = new JSZip();
+  const render = document.getElementById('invoice-render');
+  const modal  = document.getElementById('modal');
+
+  // Temporarily show modal off-screen for rendering
+  modal.style.visibility = 'hidden';
+  modal.classList.add('open');
+
+  const indices = [...histSelected].sort((a,b) => a-b);
+  for (const idx of indices) {
+    const inv = state.invoices[idx];
+    render.innerHTML = renderInvoiceHTML(inv);
+    await new Promise(r => setTimeout(r, 300)); // let render settle
+    const pdf = await generatePDFBlob();
+    zip.file(`factura-${inv.num}.pdf`, pdf.output('blob'));
+  }
+
+  modal.classList.remove('open');
+  modal.style.visibility = '';
+  render.innerHTML = '';
+
+  const search = histFilter.search ? `-${histFilter.search.replace(/\s+/g,'-')}` : '';
+  const year   = histFilter.year   ? `-${histFilter.year}` : '';
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zipBlob);
+  a.download = `facturas${search}${year}.zip`;
+  a.click();
+  showToast(`✅ ZIP descargado con ${indices.length} factura${indices.length>1?'s':''}`);
 }
 
 function reprintInvoice(idx) {
