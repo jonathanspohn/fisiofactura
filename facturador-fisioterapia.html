@@ -1254,7 +1254,7 @@ function closeModal() {
   document.getElementById('modal').classList.remove('open');
 }
 
-function generateAndSave() {
+async function generateAndSave() {
   const inv = collectInvoice();
   if (!inv.paciente.nombre) { showToast('⚠️ Introduce el nombre del paciente'); return; }
   if (!inv.services.length || !inv.services[0].desc) { showToast('⚠️ Añade al menos un servicio'); return; }
@@ -1272,6 +1272,20 @@ function generateAndSave() {
   // Prepare next number
   const prefix = state.config.prefijo || '2024-';
   document.getElementById('inv-num').value = prefix + String(state.nextNum).padStart(3,'0');
+
+  // Auto-upload PDF to Drive if connected
+  if (driveAccessToken) {
+    setTimeout(async () => {
+      try {
+        const filename = `factura-${inv.num}.pdf`;
+        const pdf = await generatePDFBlob();
+        const pdfBlob = pdf.output('blob');
+        await uploadPDFtoDrive(pdfBlob, filename);
+      } catch(e) {
+        console.error('Auto PDF upload failed:', e);
+      }
+    }, 800);
+  }
 }
 
 // ── HISTORY ──────────────────────────────────────────
@@ -1332,43 +1346,21 @@ async function downloadPDF() {
   btn.disabled = true;
 
   try {
-    // Cargar librerías si no están ya cargadas
-    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
-    await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
-
     const el = document.getElementById('invoice-render');
     const num = el.querySelector('.num')?.textContent?.trim() || 'factura';
+    const filename = `factura-${num}.pdf`;
 
-    const canvas = await html2canvas(el, {
-      scale: 2,
-      useCORS: true,
-      backgroundColor: '#ffffff',
-      logging: false
-    });
+    const pdf = await generatePDFBlob();
 
-    const imgData = canvas.toDataURL('image/jpeg', 0.95);
-    const { jsPDF } = window.jspdf;
-    const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
-
-    const pageW = pdf.internal.pageSize.getWidth();
-    const pageH = pdf.internal.pageSize.getHeight();
-    const ratio = canvas.height / canvas.width;
-    const imgH = pageW * ratio;
-
-    // Si la factura es más larga que una página, la dividimos
-    if (imgH <= pageH) {
-      pdf.addImage(imgData, 'JPEG', 0, 0, pageW, imgH);
-    } else {
-      let yPos = 0;
-      while (yPos < imgH) {
-        if (yPos > 0) pdf.addPage();
-        pdf.addImage(imgData, 'JPEG', 0, -yPos, pageW, imgH);
-        yPos += pageH;
-      }
-    }
-
-    pdf.save(`factura-${num}.pdf`);
+    // Download locally
+    pdf.save(filename);
     showToast('✅ PDF descargado correctamente');
+
+    // Auto-upload to Drive if connected
+    if (driveAccessToken) {
+      const pdfBlob = pdf.output('blob');
+      await uploadPDFtoDrive(pdfBlob, filename);
+    }
   } catch (err) {
     console.error(err);
     showToast('❌ Error al generar PDF. Prueba con imprimir > Guardar como PDF.');
@@ -1376,6 +1368,96 @@ async function downloadPDF() {
 
   btn.textContent = '⬇ Descargar PDF';
   btn.disabled = false;
+}
+
+// ── DRIVE PDF UPLOAD ──────────────────────────────────
+// Folder path: Mi unidad / Tesai / Facturas / Facturas emitidas / YEAR
+const DRIVE_FOLDER_PATH = ['Tesai', 'Facturas', 'Facturas emitidas'];
+
+async function getDriveFolder(parentId, name) {
+  // Find or create a folder by name inside parentId (null = root)
+  const parentQuery = parentId ? `'${parentId}' in parents` : `'root' in parents`;
+  const q = encodeURIComponent(`name='${name}' and mimeType='application/vnd.google-apps.folder' and ${parentQuery} and trashed=false`);
+  const r = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`, {
+    headers: { Authorization: 'Bearer ' + driveAccessToken }
+  });
+  const d = await r.json();
+  if (d.files && d.files.length > 0) return d.files[0].id;
+
+  // Create folder
+  const cr = await fetch('https://www.googleapis.com/drive/v3/files', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + driveAccessToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name,
+      mimeType: 'application/vnd.google-apps.folder',
+      parents: parentId ? [parentId] : ['root']
+    })
+  });
+  const cd = await cr.json();
+  return cd.id;
+}
+
+async function getInvoiceFolderId() {
+  let parentId = null;
+  for (const folderName of DRIVE_FOLDER_PATH) {
+    parentId = await getDriveFolder(parentId, folderName);
+  }
+  // Year folder
+  const year = new Date().getFullYear().toString();
+  parentId = await getDriveFolder(parentId, year);
+  return parentId;
+}
+
+async function uploadPDFtoDrive(pdfBlob, filename) {
+  if (!driveAccessToken) return;
+  try {
+    showToast('☁️ Guardando PDF en Drive...');
+    const folderId = await getInvoiceFolderId();
+    const meta = new Blob([JSON.stringify({ name: filename, mimeType: 'application/pdf', parents: [folderId] })], { type: 'application/json' });
+    const form = new FormData();
+    form.append('metadata', meta);
+    form.append('file', pdfBlob);
+    const r = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + driveAccessToken },
+      body: form
+    });
+    const d = await r.json();
+    if (d.id) {
+      showToast('✅ PDF guardado en Drive: Tesai/Facturas/Facturas emitidas/' + new Date().getFullYear());
+    }
+  } catch(e) {
+    console.error('Error uploading PDF to Drive:', e);
+    showToast('⚠️ No se pudo guardar en Drive. El PDF se descargó localmente.');
+  }
+}
+
+async function generatePDFBlob() {
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js');
+  await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+
+  const el = document.getElementById('invoice-render');
+  const canvas = await html2canvas(el, { scale: 2, useCORS: true, backgroundColor: '#ffffff', logging: false });
+  const imgData = canvas.toDataURL('image/jpeg', 0.95);
+  const { jsPDF } = window.jspdf;
+  const pdf = new jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
+  const pageW = pdf.internal.pageSize.getWidth();
+  const pageH = pdf.internal.pageSize.getHeight();
+  const ratio = canvas.height / canvas.width;
+  const imgH = pageW * ratio;
+
+  if (imgH <= pageH) {
+    pdf.addImage(imgData, 'JPEG', 0, 0, pageW, imgH);
+  } else {
+    let yPos = 0;
+    while (yPos < imgH) {
+      if (yPos > 0) pdf.addPage();
+      pdf.addImage(imgData, 'JPEG', 0, -yPos, pageW, imgH);
+      yPos += pageH;
+    }
+  }
+  return pdf;
 }
 
 function loadScript(src) {
@@ -1688,7 +1770,7 @@ function importAllData(event) {
 
 // ── GOOGLE CLIENT ID ─────────────────────────────────
 const GOOGLE_CLIENT_ID = '177404929671-gsr79epna20vadoc94n4p6mnm8e2jk58.apps.googleusercontent.com';
-const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 const FISIOFACTURA_FILE = 'fisiofactura_datos.json';
 
 let googleUser = null;
